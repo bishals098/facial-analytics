@@ -295,7 +295,7 @@ def main():
     if os.path.exists(preprocessor.imdb_path) and os.path.exists(imdb_mat_path):
         print("Found IMDB dataset")
         imdb_images, imdb_ages, imdb_genders = preprocessor.process_dataset(
-            preprocessor.imdb_path, 'imdb.mat', max_images=1000
+            preprocessor.imdb_path, 'imdb.mat'
         )
         if imdb_images is not None:
             all_images.append(imdb_images)
@@ -313,7 +313,7 @@ def main():
     if os.path.exists(preprocessor.wiki_path) and os.path.exists(wiki_mat_path):
         print("Found WIKI dataset")
         wiki_images, wiki_ages, wiki_genders = preprocessor.process_dataset(
-            preprocessor.wiki_path, 'wiki.mat', max_images=1000
+            preprocessor.wiki_path, 'wiki.mat'
         )
         if wiki_images is not None:
             all_images.append(wiki_images)
