@@ -112,7 +112,7 @@ class PipelineRunner:
         # Check trained model
         model_files = []
         if os.path.exists(self.models_dir):
-            model_files = [f for f in os.listdir(self.models_dir) if f.endswith('.h5')]
+            model_files = [f for f in os.listdir(self.models_dir) if f.endswith('.keras')]
         
         results['trained_model'] = len(model_files) > 0
         print(f"Trained model: {'OK' if results['trained_model'] else 'MISSING'}")

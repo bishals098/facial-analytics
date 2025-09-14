@@ -126,19 +126,25 @@ def main():
     st.sidebar.header("⚙️ Configuration")
     
     # Model selection
-    model_files = [f for f in os.listdir('.') if f.endswith('.h5')]
-    
+    # Model selection - look in models directory
+    models_dir = 'models'
+    if os.path.exists(models_dir):
+        model_files = [f for f in os.listdir(models_dir) if f.endswith('.keras')]
+    else:
+        model_files = []
+
     if not model_files:
         st.error("❌ No trained model found! Please train a model first using train.py")
-        st.info("💡 Make sure you have a .h5 model file in the current directory")
+        st.info("💡 Make sure you have .keras model files in the models/ directory")
         return
-    
+
     selected_model = st.sidebar.selectbox("Select Model", model_files)
-    
+    model_path = os.path.join(models_dir, selected_model)
+
     # Load detector
     if st.session_state.detector is None or st.sidebar.button("🔄 Reload Model"):
         with st.spinner("Loading model..."):
-            st.session_state.detector = load_detector(selected_model)
+            st.session_state.detector = load_detector(model_path)  # Use full path
         
         if st.session_state.detector is None:
             st.error("Failed to load model")

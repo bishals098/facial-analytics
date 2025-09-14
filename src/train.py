@@ -10,6 +10,23 @@ from tensorflow.keras.preprocessing.image import ImageDataGenerator
 import json
 from datetime import datetime
 
+def configure_gpu():
+    """Configure GPU settings for optimal performance"""
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    if gpus:
+        try:
+            # Enable memory growth to avoid allocating all GPU memory at once
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            
+            print(f"✅ Found {len(gpus)} GPU(s)")
+            for i, gpu in enumerate(gpus):
+                print(f"   GPU {i}: {gpu.name}")
+        except RuntimeError as e:
+            print(f"❌ GPU configuration error: {e}")
+    else:
+        print("⚠️  No GPUs found, using CPU")
+
 # Fix Unicode encoding for Windows
 if sys.platform.startswith('win'):
     os.environ['PYTHONIOENCODING'] = 'utf-8'
@@ -121,7 +138,7 @@ class ModelTrainer:
         return self.model
     
     def train_model(self, X_train, X_val, y_age_train, y_age_val, 
-               y_gender_train, y_gender_val, epochs=20, batch_size=32):
+               y_gender_train, y_gender_val, epochs=50, batch_size=128):
         """Train the model - let Keras calculate steps automatically"""
         print(f"Starting training...")
         print(f"   - Epochs: {epochs}")
@@ -129,6 +146,9 @@ class ModelTrainer:
         print(f"   - Training samples: {len(X_train)}")
         print(f"   - Validation samples: {len(X_val)}")
     
+        # Enable mixed precision for faster training (optional)
+        tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
         # Prepare training data
         y_train = {
             'age_output': y_age_train,
@@ -142,7 +162,7 @@ class ModelTrainer:
 
         # Get callbacks
         model_name = os.path.join(self.models_dir, f'best_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}.keras')
-        callbacks = self.mt_cnn.create_callbacks(model_name=model_name)
+        callbacks = self.mt_cnn.create_callbacks(model_name=model_name, patience=20)
 
         # Train model - NO steps_per_epoch or validation_steps
         self.history = self.model.fit(
@@ -210,10 +230,13 @@ class ModelTrainer:
 def main():
     """Main training function"""
     print("Starting Age & Gender Detection Model Training")
-    print("=" * 60)
+    print("=" * 70)
     
     # Initialize trainer
     trainer = ModelTrainer()
+
+    #configure GPU
+    configure_gpu()
     
     # Load data
     images, ages, genders, metadata = trainer.load_data()
@@ -237,8 +260,8 @@ def main():
         X_train, X_val,
         y_age_train, y_age_val,
         y_gender_train, y_gender_val,
-        epochs=20,  # Adjust as needed
-        batch_size=32
+        epochs=50,
+        batch_size=128
     )
     
     # Evaluate model

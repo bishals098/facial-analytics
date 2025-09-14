@@ -108,7 +108,7 @@ class IMDBWIKIPreprocessor:
         except Exception as e:
             return None
     
-    def process_dataset(self, dataset_path, mat_file, max_images=25000):
+    def process_dataset(self, dataset_path, mat_file):
         """Process entire dataset"""
         print(f"\n{'='*50}")
         print(f"Processing {dataset_path}...")
@@ -138,12 +138,9 @@ class IMDBWIKIPreprocessor:
         invalid_count = 0
         
         total_records = len(metadata['dob'])
-        print(f"Processing up to {max_images} images from {total_records} records...")
+        print(f"Processing all {total_records} images from dataset...")
         
-        for i in range(min(total_records, max_images * 2)):  # Process more to get enough valid images
-            if valid_count >= max_images:
-                break
-                
+        for i in range(total_records):  # Process more to get enough valid images
             try:
                 dob = metadata['dob'][i]
                 photo_taken = metadata['photo_taken'][i]
@@ -177,7 +174,7 @@ class IMDBWIKIPreprocessor:
                     genders.append(int(gender))  # 0: female, 1: male
                     valid_count += 1
                     
-                    if valid_count % 1000 == 0:
+                    if valid_count % 5000 == 0:
                         print(f"Processed {valid_count} valid images, skipped {invalid_count} invalid")
                 else:
                     invalid_count += 1

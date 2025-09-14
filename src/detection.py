@@ -118,9 +118,7 @@ class FaceDetectionPipeline:
                 return "Preprocessing Error", "Preprocessing Error", 0.0, 0.0
             
             # Make predictions
-            with tf.device('/CPU:0'):  # Use CPU for consistency
-                predictions = self.model.predict(processed_face, verbose=0)
-            
+            predictions = self.model.predict(processed_face, verbose=0)
             age_pred, gender_pred = predictions
             
             # Get predicted classes and confidence
