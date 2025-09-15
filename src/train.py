@@ -4,8 +4,13 @@ import numpy as np
 import pickle
 import json
 from datetime import datetime
-import tensorflow as tf
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as transforms
 import h5py
+from tqdm import tqdm
 
 # Fix Unicode encoding for Windows
 if sys.platform.startswith('win'):
@@ -16,19 +21,65 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 def configure_gpu():
     """Configure GPU settings for optimal performance"""
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    if gpus:
-        try:
-            # Enable memory growth to avoid allocating all GPU memory at once
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"✅ Found {len(gpus)} GPU(s)")
-            for i, gpu in enumerate(gpus):
-                print(f"   GPU {i}: {gpu.name}")
-        except RuntimeError as e:
-            print(f"❌ GPU configuration error: {e}")
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        gpu_count = torch.cuda.device_count()
+        print(f"✅ Found {gpu_count} GPU(s)")
+        for i in range(gpu_count):
+            print(f"   GPU {i}: {torch.cuda.get_device_name(i)}")
+        print(f"   CUDA Version: {torch.version.cuda}")
+        return device
     else:
         print("⚠️  No GPUs found, using CPU")
+        return torch.device('cpu')
+
+class HDF5Dataset(Dataset):
+    """PyTorch Dataset for HDF5 chunked data"""
+    
+    def __init__(self, hdf5_data_dir, transform=None, split='train'):
+        self.transform = transform
+        self.split = split
+        
+        # Load dataset index
+        index_file = os.path.join(hdf5_data_dir, 'dataset_index.pkl')
+        with open(index_file, 'rb') as f:
+            self.index = pickle.load(f)
+        
+        # Get all chunk files
+        self.chunk_files = self.index['imdb_chunks'] + self.index['wiki_chunks']
+        
+        # Build sample index for efficient access
+        self.sample_index = []
+        for chunk_info in self.index['chunk_info']:
+            for i in range(chunk_info['size']):
+                self.sample_index.append((chunk_info['file'], i))
+        
+        print(f"📊 {split.upper()} Dataset Info:")
+        print(f"   - Chunk files: {len(self.chunk_files)}")
+        print(f"   - Total samples: {len(self.sample_index):,}")
+    
+    def __len__(self):
+        return len(self.sample_index)
+    
+    def __getitem__(self, idx):
+        chunk_file, sample_idx = self.sample_index[idx]
+        
+        # Load data from HDF5 chunk
+        with h5py.File(chunk_file, 'r') as f:
+            image = f['images'][sample_idx]
+            age = f['ages'][sample_idx]
+            gender = f['genders'][sample_idx]
+        
+        # TensorFlow format (H, W, C) -> PyTorch format (C, H, W)
+        image = torch.FloatTensor(image).permute(2, 0, 1)
+        age = torch.LongTensor([age]).squeeze()
+        gender = torch.LongTensor([gender]).squeeze()
+        
+        # Apply transforms if provided
+        if self.transform:
+            image = self.transform(image)
+        
+        return image, age, gender
 
 class HDF5StreamingTrainer:
     def __init__(self):
@@ -41,9 +92,12 @@ class HDF5StreamingTrainer:
         self.legacy_data_dir = os.path.join(self.project_root, 'data', 'processed_data')  # Fallback
         self.models_dir = os.path.join(self.project_root, 'models')
         
+        self.device = configure_gpu()
         self.model = None
-        self.mt_cnn = None
-        self.history = None
+        self.optimizer = None
+        self.scheduler = None
+        self.training_history = {'train_loss': [], 'val_loss': [], 'train_age_acc': [], 
+                               'train_gender_acc': [], 'val_age_acc': [], 'val_gender_acc': []}
         
         # Create models directory if it doesn't exist
         os.makedirs(self.models_dir, exist_ok=True)
@@ -52,330 +106,357 @@ class HDF5StreamingTrainer:
         print(f"HDF5 data directory: {self.hdf5_data_dir}")
         print(f"Legacy data directory: {self.legacy_data_dir}")
         print(f"Models directory: {self.models_dir}")
+        print(f"Device: {self.device}")
 
-    def load_chunk_generator(self, chunk_files, shuffle=True):
-        """Generator that loads HDF5 chunks on-demand"""
-        if shuffle:
-            np.random.shuffle(chunk_files)
-            
-        for chunk_file in chunk_files:
-            try:
-                with h5py.File(chunk_file, 'r') as f:
-                    images = f['images'][:]
-                    ages = f['ages'][:]
-                    genders = f['genders'][:]
-                    
-                    # Yield each sample individually
-                    for i in range(len(images)):
-                        yield images[i], ages[i], genders[i]
-                        
-            except Exception as e:
-                print(f"⚠️  Warning: Could not load chunk {chunk_file}: {e}")
-                continue
-
-    def create_streaming_dataset(self, batch_size=64, buffer_size=2000):
-        """Create a streaming dataset from HDF5 chunk files"""
+    def create_data_transforms(self):
+        """Create data augmentation transforms"""
+        train_transform = transforms.Compose([
+            transforms.RandomRotation(degrees=15),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.2, contrast=0.1, saturation=0.1, hue=0.05),
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1), scale=(0.9, 1.1))
+        ])
         
-        # Try to load HDF5 chunk index
+        val_transform = transforms.Compose([
+            # No augmentation for validation
+        ])
+        
+        return train_transform, val_transform
+
+    def create_dataloaders(self, batch_size=64, num_workers=4):
+        """Create PyTorch DataLoaders for training"""
+        
+        # Check if HDF5 data exists
         index_file = os.path.join(self.hdf5_data_dir, 'dataset_index.pkl')
+        if not os.path.exists(index_file):
+            print("⚠️  HDF5 chunked dataset not found!")
+            print(f"Expected index file: {index_file}")
+            return None, None, None
         
-        if os.path.exists(index_file):
-            print("📄 Loading HDF5 chunked dataset...")
-            with open(index_file, 'rb') as f:
-                index = pickle.load(f)
-            
-            all_chunk_files = index['imdb_chunks'] + index['wiki_chunks']
-            total_samples = index['total_samples']
-            
-            print(f"📊 HDF5 Dataset Info:")
-            print(f"   - HDF5 chunk files: {len(all_chunk_files)}")
-            print(f"   - Total samples: {total_samples:,}")
-            print(f"   - Batch size: {batch_size}")
-            print(f"   - Buffer size: {buffer_size:,}")
-            
-            # Create dataset from generator
-            dataset = tf.data.Dataset.from_generator(
-                lambda: self.load_chunk_generator(all_chunk_files, shuffle=True),
-                output_signature=(
-                    tf.TensorSpec(shape=(128, 128, 3), dtype=tf.float32),
-                    tf.TensorSpec(shape=(), dtype=tf.int32),
-                    tf.TensorSpec(shape=(), dtype=tf.int32)
-                )
-            )
-            
-            # Apply optimizations for streaming
-            dataset = dataset.shuffle(buffer_size=buffer_size)
-            dataset = dataset.batch(batch_size)
-            dataset = dataset.prefetch(tf.data.AUTOTUNE)
-            
-            return dataset, total_samples
-            
-        else:
-            print("⚠️  HDF5 chunked dataset not found, falling back to legacy data loading...")
-            return self.load_legacy_data(batch_size)
+        print("📄 Loading HDF5 chunked dataset...")
+        
+        # Create transforms
+        train_transform, val_transform = self.create_data_transforms()
+        
+        # Create dataset
+        full_dataset = HDF5Dataset(self.hdf5_data_dir, transform=None)
+        
+        # Split dataset indices
+        total_size = len(full_dataset)
+        train_size = int(0.7 * total_size)
+        val_size = int(0.2 * total_size)
+        test_size = total_size - train_size - val_size
+        
+        # Create split indices
+        indices = torch.randperm(total_size).tolist()
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:train_size + val_size]
+        test_indices = indices[train_size + val_size:]
+        
+        print(f"📊 Dataset split:")
+        print(f"   - Training: {len(train_indices):,} samples (70%)")
+        print(f"   - Validation: {len(val_indices):,} samples (20%)")
+        print(f"   - Test: {len(test_indices):,} samples (10%)")
+        
+        # Create subset datasets
+        train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
+        test_dataset = torch.utils.data.Subset(full_dataset, test_indices)
+        
+        # Apply transforms to training data
+        train_dataset.dataset.transform = train_transform
+        
+        # Create DataLoaders
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, 
+            num_workers=num_workers, pin_memory=True
+        )
+        
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False, 
+            num_workers=num_workers, pin_memory=True
+        )
+        
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False, 
+            num_workers=num_workers, pin_memory=True
+        )
+        
+        return train_loader, val_loader, test_loader
 
-    def load_legacy_data(self, batch_size=64):
-        """Fallback method to load legacy .npy files"""
-        print("📁 Loading legacy preprocessed data...")
-        
-        try:
-            # Check if files exist
-            images_path = os.path.join(self.legacy_data_dir, 'images.npy')
-            ages_path = os.path.join(self.legacy_data_dir, 'ages.npy')
-            genders_path = os.path.join(self.legacy_data_dir, 'genders.npy')
-            metadata_path = os.path.join(self.legacy_data_dir, 'metadata.pkl')
-            
-            print(f"Looking for legacy files:")
-            print(f"   Images: {images_path} (exists: {os.path.exists(images_path)})")
-            print(f"   Ages: {ages_path} (exists: {os.path.exists(ages_path)})")
-            print(f"   Genders: {genders_path} (exists: {os.path.exists(genders_path)})")
-            print(f"   Metadata: {metadata_path} (exists: {os.path.exists(metadata_path)})")
-            
-            # Load arrays
-            images = np.load(images_path)
-            ages = np.load(ages_path)
-            genders = np.load(genders_path)
-            
-            # Load metadata
-            with open(metadata_path, 'rb') as f:
-                metadata = pickle.load(f)
-            
-            print(f"✅ Legacy data loaded successfully!")
-            print(f"   - Images shape: {images.shape}")
-            print(f"   - Ages shape: {ages.shape}")
-            print(f"   - Genders shape: {genders.shape}")
-            
-            # Convert to TensorFlow dataset
-            dataset = tf.data.Dataset.from_tensor_slices((
-                images, 
-                ages,
-                genders
-            ))
-            dataset = dataset.shuffle(buffer_size=1000)
-            dataset = dataset.batch(batch_size)
-            dataset = dataset.prefetch(tf.data.AUTOTUNE)
-            
-            return dataset, len(images)
-            
-        except Exception as e:
-            print(f"❌ Error loading legacy data: {e}")
-            print("💡 Make sure to run preprocessing.py first!")
-            return None, 0
-
-    def split_streaming_dataset(self, dataset, total_samples, train_ratio=0.7, val_ratio=0.2):
-        """Split streaming dataset into train/val/test"""
-        
-        # Calculate approximate sizes (batch-based splitting)
-        total_batches = total_samples // 64  # Approximate batches
-        train_batches = int(total_batches * train_ratio)
-        val_batches = int(total_batches * val_ratio)
-        test_batches = total_batches - train_batches - val_batches
-        
-        train_size = train_batches * 64
-        val_size = val_batches * 64
-        test_size = test_batches * 64
-        
-        print(f"📊 Dataset split (approximate):")
-        print(f"   - Training: {train_size:,} samples ({train_ratio*100:.1f}%)")
-        print(f"   - Validation: {val_size:,} samples ({val_ratio*100:.1f}%)")
-        print(f"   - Test: {test_size:,} samples ({(1-train_ratio-val_ratio)*100:.1f}%)")
-        
-        # Split dataset by batches
-        train_dataset = dataset.take(train_batches)
-        remaining_dataset = dataset.skip(train_batches)
-        
-        val_dataset = remaining_dataset.take(val_batches)
-        test_dataset = remaining_dataset.skip(val_batches)
-        
-        return train_dataset, val_dataset, test_dataset
-
-    def prepare_dataset_for_training(self, dataset):
-        """Prepare dataset for multi-task training"""
-        def format_data(image, age, gender):
-            return image, {'age_output': age, 'gender_output': gender}
-        
-        return dataset.map(format_data, num_parallel_calls=tf.data.AUTOTUNE)
-
-    def create_model(self, input_shape=(128, 128, 3), use_pretrained=True):
-        """Create and compile model with optimizations for better accuracy"""
-        print("🏗️  Creating model optimized for better accuracy...")
+    def create_model(self, input_shape=(3, 128, 128), use_pretrained=True):
+        """Create and setup model with optimizations for better accuracy"""
+        print("🏗️  Creating PyTorch model optimized for better accuracy...")
         
         from model import MultiTaskCNN
         
-        self.mt_cnn = MultiTaskCNN(input_shape=input_shape)
-        self.model = self.mt_cnn.create_model(use_pretrained=use_pretrained)
+        # Create model
+        self.model = MultiTaskCNN(input_shape=input_shape).to(self.device)
+        self.model.create_model(use_pretrained=use_pretrained)
         
-        # Lower learning rate for better convergence
-        self.model = self.mt_cnn.compile_model(
-            self.model, 
-            learning_rate=0.00005,  # Even lower for streaming data
-            age_weight=1.5,         # Slight boost to age task
-            gender_weight=1.0
+        # Setup optimizer and loss (lower learning rate for better convergence)
+        self.model.compile_model(learning_rate=0.00005, age_weight=1.5, gender_weight=1.0)
+        
+        # Setup learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.model.optimizer, mode='min', factor=0.3, patience=12, 
+            min_lr=1e-8, verbose=True
         )
         
-        print("✅ Model created and compiled successfully!")
+        print("✅ PyTorch model created and configured successfully!")
         return self.model
 
-    def create_data_augmentation(self):
-        """Create data augmentation pipeline"""
-        return tf.keras.Sequential([
-            tf.keras.layers.RandomRotation(0.15),
-            tf.keras.layers.RandomTranslation(0.1, 0.1),
-            tf.keras.layers.RandomFlip("horizontal"),
-            tf.keras.layers.RandomBrightness(0.2),
-            tf.keras.layers.RandomContrast(0.1),
-            tf.keras.layers.RandomZoom(0.1),
-        ], name="data_augmentation")
+    def train_epoch(self, train_loader):
+        """Train for one epoch"""
+        self.model.train()
+        running_loss = 0.0
+        correct_age = 0
+        correct_gender = 0
+        total_samples = 0
+        
+        # Progress bar
+        pbar = tqdm(train_loader, desc='Training')
+        
+        for batch_idx, (images, ages, genders) in enumerate(pbar):
+            # Move to device
+            images = images.to(self.device)
+            ages = ages.to(self.device)
+            genders = genders.to(self.device)
+            
+            # Forward pass
+            self.model.optimizer.zero_grad()
+            age_pred, gender_pred = self.model(images)
+            
+            # Calculate loss
+            total_loss, age_loss, gender_loss = self.model.calculate_loss(
+                age_pred, gender_pred, ages, genders
+            )
+            
+            # Backward pass
+            total_loss.backward()
+            self.model.optimizer.step()
+            
+            # Statistics
+            running_loss += total_loss.item()
+            
+            # Calculate accuracy
+            _, age_predicted = torch.max(age_pred.data, 1)
+            _, gender_predicted = torch.max(gender_pred.data, 1)
+            
+            correct_age += (age_predicted == ages).sum().item()
+            correct_gender += (gender_predicted == genders).sum().item()
+            total_samples += ages.size(0)
+            
+            # Update progress bar
+            pbar.set_postfix({
+                'Loss': f'{total_loss.item():.4f}',
+                'Age Acc': f'{100 * correct_age / total_samples:.2f}%',
+                'Gender Acc': f'{100 * correct_gender / total_samples:.2f}%'
+            })
+        
+        epoch_loss = running_loss / len(train_loader)
+        age_accuracy = correct_age / total_samples
+        gender_accuracy = correct_gender / total_samples
+        
+        return epoch_loss, age_accuracy, gender_accuracy
+
+    def validate_epoch(self, val_loader):
+        """Validate for one epoch"""
+        self.model.eval()
+        running_loss = 0.0
+        correct_age = 0
+        correct_gender = 0
+        total_samples = 0
+        
+        with torch.no_grad():
+            pbar = tqdm(val_loader, desc='Validation')
+            
+            for images, ages, genders in pbar:
+                # Move to device
+                images = images.to(self.device)
+                ages = ages.to(self.device)
+                genders = genders.to(self.device)
+                
+                # Forward pass
+                age_pred, gender_pred = self.model(images)
+                
+                # Calculate loss
+                total_loss, _, _ = self.model.calculate_loss(
+                    age_pred, gender_pred, ages, genders
+                )
+                
+                # Statistics
+                running_loss += total_loss.item()
+                
+                # Calculate accuracy
+                _, age_predicted = torch.max(age_pred.data, 1)
+                _, gender_predicted = torch.max(gender_pred.data, 1)
+                
+                correct_age += (age_predicted == ages).sum().item()
+                correct_gender += (gender_predicted == genders).sum().item()
+                total_samples += ages.size(0)
+                
+                # Update progress bar
+                pbar.set_postfix({
+                    'Loss': f'{total_loss.item():.4f}',
+                    'Age Acc': f'{100 * correct_age / total_samples:.2f}%',
+                    'Gender Acc': f'{100 * correct_gender / total_samples:.2f}%'
+                })
+        
+        epoch_loss = running_loss / len(val_loader)
+        age_accuracy = correct_age / total_samples
+        gender_accuracy = correct_gender / total_samples
+        
+        return epoch_loss, age_accuracy, gender_accuracy
 
     def train_with_hdf5_streaming(self, epochs=100, batch_size=64):
         """Train model using HDF5 streaming with enhanced optimizations"""
-        print("🚀 Starting HDF5 streaming training with enhanced optimizations...")
+        print("🚀 Starting PyTorch HDF5 streaming training...")
         print(f"📋 Training configuration:")
         print(f"   - Epochs: {epochs}")
         print(f"   - Batch size: {batch_size}")
         print(f"   - Data source: HDF5 chunks")
         print(f"   - Data augmentation: Enhanced")
         print(f"   - Early stopping patience: 25")
+        print(f"   - Device: {self.device}")
         
-        # Create streaming dataset
-        dataset, total_samples = self.create_streaming_dataset(batch_size=batch_size)
+        # Create data loaders
+        train_loader, val_loader, test_loader = self.create_dataloaders(batch_size=batch_size)
         
-        if dataset is None:
-            print("❌ Failed to create dataset!")
+        if train_loader is None:
+            print("❌ Failed to create data loaders!")
             return None, None
-        
-        # Split dataset
-        train_dataset, val_dataset, test_dataset = self.split_streaming_dataset(
-            dataset, total_samples
-        )
-        
-        # Prepare datasets for multi-task training
-        train_dataset = self.prepare_dataset_for_training(train_dataset)
-        val_dataset = self.prepare_dataset_for_training(val_dataset)
-        test_dataset = self.prepare_dataset_for_training(test_dataset)
-        
-        # Add data augmentation to training dataset
-        augmentation = self.create_data_augmentation()
-        
-        def augment_training_data(x, y):
-            return augmentation(x, training=True), y
-        
-        train_dataset = train_dataset.map(
-            augment_training_data, 
-            num_parallel_calls=tf.data.AUTOTUNE
-        )
         
         # Create model
         model = self.create_model()
         
-        # Enhanced callbacks
+        # Training setup
+        best_val_loss = float('inf')
+        patience_counter = 0
+        patience = 25
+        
         model_name = os.path.join(
             self.models_dir, 
-            f'hdf5_streaming_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}.keras'
+            f'pytorch_streaming_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pth'
         )
-        
-        callbacks = [
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_loss',
-                patience=25,  # More patience for streaming data
-                restore_best_weights=True,
-                verbose=1
-            ),
-            tf.keras.callbacks.ReduceLROnPlateau(
-                monitor='val_loss',
-                factor=0.3,   # More aggressive LR reduction
-                patience=12,
-                min_lr=1e-8,
-                verbose=1
-            ),
-            tf.keras.callbacks.ModelCheckpoint(
-                model_name,
-                monitor='val_loss',
-                save_best_only=True,
-                save_weights_only=False,
-                verbose=1
-            ),
-            tf.keras.callbacks.CSVLogger(
-                os.path.join(self.models_dir, 'hdf5_training_log.csv'),
-                append=True
-            ),
-            # Learning rate schedule for better convergence
-            tf.keras.callbacks.LearningRateScheduler(
-                lambda epoch: 0.00005 * (0.95 ** epoch),
-                verbose=0
-            )
-        ]
         
         print(f"💾 Model will be saved as: {model_name}")
+        print("🎯 Starting PyTorch streaming training...")
         
-        # Train with streaming data
-        print("🎯 Starting HDF5 streaming training...")
-        
-        self.history = model.fit(
-            train_dataset,
-            validation_data=val_dataset,
-            epochs=epochs,
-            callbacks=callbacks,
-            verbose=1
-        )
+        # Training loop
+        for epoch in range(epochs):
+            print(f"\nEpoch {epoch+1}/{epochs}")
+            print("-" * 50)
+            
+            # Train
+            train_loss, train_age_acc, train_gender_acc = self.train_epoch(train_loader)
+            
+            # Validate
+            val_loss, val_age_acc, val_gender_acc = self.validate_epoch(val_loader)
+            
+            # Update learning rate scheduler
+            self.scheduler.step(val_loss)
+            
+            # Store history
+            self.training_history['train_loss'].append(train_loss)
+            self.training_history['val_loss'].append(val_loss)
+            self.training_history['train_age_acc'].append(train_age_acc)
+            self.training_history['train_gender_acc'].append(train_gender_acc)
+            self.training_history['val_age_acc'].append(val_age_acc)
+            self.training_history['val_gender_acc'].append(val_gender_acc)
+            
+            # Print epoch results
+            print(f"\nEpoch {epoch+1} Results:")
+            print(f"   Train - Loss: {train_loss:.4f}, Age Acc: {train_age_acc:.4f} ({train_age_acc*100:.2f}%), Gender Acc: {train_gender_acc:.4f} ({train_gender_acc*100:.2f}%)")
+            print(f"   Val   - Loss: {val_loss:.4f}, Age Acc: {val_age_acc:.4f} ({val_age_acc*100:.2f}%), Gender Acc: {val_gender_acc:.4f} ({val_gender_acc*100:.2f}%)")
+            print(f"   Learning Rate: {self.model.optimizer.param_groups[0]['lr']:.2e}")
+            
+            # Save best model
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                patience_counter = 0
+                
+                # Save model checkpoint
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': self.model.state_dict(),
+                    'optimizer_state_dict': self.model.optimizer.state_dict(),
+                    'scheduler_state_dict': self.scheduler.state_dict(),
+                    'val_loss': val_loss,
+                    'val_age_acc': val_age_acc,
+                    'val_gender_acc': val_gender_acc,
+                    'training_history': self.training_history
+                }, model_name)
+                
+                print(f"   💾 Saved best model checkpoint")
+            else:
+                patience_counter += 1
+            
+            # Early stopping
+            if patience_counter >= patience:
+                print(f"\n⏹️  Early stopping triggered after {patience} epochs without improvement")
+                break
         
         print("✅ Training completed!")
         
         # Evaluate on test set
         print("📊 Evaluating on test set...")
-        test_results = model.evaluate(test_dataset, verbose=1)
+        test_loss, test_age_acc, test_gender_acc = self.validate_epoch(test_loader)
         
         print(f"🎯 Final test results:")
-        print(f"   - Overall loss: {test_results[0]:.4f}")
-        if len(test_results) > 1:
-            print(f"   - Age loss: {test_results[1]:.4f}")
-            print(f"   - Gender loss: {test_results[2]:.4f}")
-            if len(test_results) > 3:
-                print(f"   - Age accuracy: {test_results[3]:.4f} ({test_results[3]*100:.2f}%)")
-                print(f"   - Gender accuracy: {test_results[4]:.4f} ({test_results[4]*100:.2f}%)")
+        print(f"   - Overall loss: {test_loss:.4f}")
+        print(f"   - Age accuracy: {test_age_acc:.4f} ({test_age_acc*100:.2f}%)")
+        print(f"   - Gender accuracy: {test_gender_acc:.4f} ({test_gender_acc*100:.2f}%)")
         
-        return self.history, test_results
+        test_results = {
+            'test_loss': test_loss,
+            'test_age_accuracy': test_age_acc,
+            'test_gender_accuracy': test_gender_acc
+        }
+        
+        return self.training_history, test_results
 
     def save_training_results(self, test_results):
         """Save training results and metadata"""
         print("💾 Saving training results...")
         
-        # Save history
-        if self.history:
-            history_dict = {key: [float(val) for val in values]
-                          for key, values in self.history.history.items()}
-            
-            with open(os.path.join(self.models_dir, 'hdf5_training_history.json'), 'w') as f:
-                json.dump(history_dict, f, indent=2)
+        # Save training history
+        history_file = os.path.join(self.models_dir, 'pytorch_training_history.json')
+        with open(history_file, 'w') as f:
+            # Convert numpy types to native Python types for JSON serialization
+            history_json = {}
+            for key, values in self.training_history.items():
+                history_json[key] = [float(v) for v in values]
+            json.dump(history_json, f, indent=2)
         
         # Save test results
         results_dict = {
-            'test_results': [float(x) for x in test_results] if isinstance(test_results, (list, tuple)) else test_results,
+            'test_results': test_results,
             'training_completed': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'model_type': 'hdf5_streaming_multitask_cnn',
+            'model_type': 'pytorch_hdf5_streaming_multitask_cnn',
             'data_format': 'hdf5_chunked_streaming',
-            'framework': 'tensorflow_keras'
+            'framework': 'pytorch',
+            'device': str(self.device),
+            'total_epochs': len(self.training_history['train_loss'])
         }
         
-        with open(os.path.join(self.models_dir, 'hdf5_test_results.json'), 'w') as f:
+        results_file = os.path.join(self.models_dir, 'pytorch_test_results.json')
+        with open(results_file, 'w') as f:
             json.dump(results_dict, f, indent=2)
         
-        print(f"📁 Training results saved to {self.models_dir}/")
+        print(f"📁 PyTorch training results saved to {self.models_dir}/")
 
 def main():
-    """Main training function with HDF5 streaming"""
-    print("🎯 Age & Gender Detection - HDF5 Streaming Training")
+    """Main training function with PyTorch HDF5 streaming"""
+    print("🎯 Age & Gender Detection - PyTorch HDF5 Streaming Training")
     print("=" * 70)
     print(f"🕐 Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("📄 Using HDF5 chunked data storage for memory efficiency")
-    
-    # Configure GPU
-    configure_gpu()
+    print("📄 Using PyTorch with HDF5 chunked data storage for memory efficiency")
     
     # Initialize trainer
     trainer = HDF5StreamingTrainer()
     
-    # Train with HDF5 streaming approach
+    # Train with PyTorch HDF5 streaming approach
     try:
         history, test_results = trainer.train_with_hdf5_streaming(
             epochs=100,     # More epochs for better accuracy with large dataset
@@ -386,24 +467,24 @@ def main():
             # Save results
             trainer.save_training_results(test_results)
             
-            print("\n🎉 Training completed successfully!")
+            print("\n🎉 PyTorch training completed successfully!")
             print("📊 Summary:")
-            print(f"   - Final validation loss: {min(history.history['val_loss']):.4f}")
-            print(f"   - Training epochs: {len(history.history['loss'])}")
+            print(f"   - Final validation loss: {min(history['val_loss']):.4f}")
+            print(f"   - Training epochs: {len(history['train_loss'])}")
             print(f"   - Data source: HDF5 chunked streaming")
+            print(f"   - Framework: PyTorch")
             print(f"   - Memory usage: Minimal (< 4GB)")
-            print(f"   - Model format: .keras (modern TensorFlow)")
+            print(f"   - Model format: .pth (PyTorch)")
             
             # Show best accuracy achieved
-            if 'val_age_output_accuracy' in history.history:
-                best_age_acc = max(history.history['val_age_output_accuracy'])
-                best_gender_acc = max(history.history['val_gender_output_accuracy'])
-                print(f"   - Best validation age accuracy: {best_age_acc:.4f} ({best_age_acc*100:.2f}%)")
-                print(f"   - Best validation gender accuracy: {best_gender_acc:.4f} ({best_gender_acc*100:.2f}%)")
+            best_val_age_acc = max(history['val_age_acc'])
+            best_val_gender_acc = max(history['val_gender_acc'])
+            print(f"   - Best validation age accuracy: {best_val_age_acc:.4f} ({best_val_age_acc*100:.2f}%)")
+            print(f"   - Best validation gender accuracy: {best_val_gender_acc:.4f} ({best_val_gender_acc*100:.2f}%)")
             
             print("\n➡️  Next steps:")
-            print("1. Run streamlit_app.py to test the model with live camera")
-            print("2. Use python src/detection.py for direct testing")
+            print("1. Update detection.py to use PyTorch model loading")
+            print("2. Update streamlit_app.py to test the PyTorch model with live camera")
             print("3. Model should have much better accuracy and confidence now!")
             
         else:

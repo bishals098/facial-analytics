@@ -21,7 +21,7 @@ class MemoryEfficientPreprocessor:
         self.imdb_path = os.path.join(self.data_root, 'imdb_crop')
         self.wiki_path = os.path.join(self.data_root, 'wiki_crop')
         
-        # NEW: Efficient storage path using HDF5 chunks
+        # Efficient storage path using HDF5 chunks
         self.efficient_data_path = os.path.join(self.data_root, 'efficient_data')
         self.target_size = (128, 128)
         
