@@ -37,7 +37,7 @@ class MultiTaskCNN(nn.Module):
         if use_pretrained and architecture == 'vgg16':
             # Use VGG16 as backbone (pre-trained on ImageNet)
             print(" - Using VGG16 backbone")
-            vgg16 = models.vgg16(pretrained=True)
+            vgg16 = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
             
             # Remove the classifier (last layer)
             self.backbone = nn.Sequential(*list(vgg16.features))

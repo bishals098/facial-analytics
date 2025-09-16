@@ -1,9 +1,7 @@
-import tensorflow as tf
-
-print("TensorFlow Version:", tf.__version__)
-print("Number of GPUs Available:", len(tf.config.list_physical_devices('GPU')))
-print("GPU devices:", tf.config.list_physical_devices('GPU'))
-print("Built with CUDA:", tf.test.is_built_with_cuda())
-
-# Test GPU device name
-print("GPU device name:", tf.test.gpu_device_name())
+import torch
+print("CUDA Available:", torch.cuda.is_available())
+print("CUDA Version:", torch.version.cuda)
+print("GPU Count:", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("GPU Name:", torch.cuda.get_device_name(0))
+    print("GPU Memory:", torch.cuda.get_device_properties(0).total_memory / 1e9, "GB")

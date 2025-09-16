@@ -123,7 +123,7 @@ class HDF5StreamingTrainer:
         
         return train_transform, val_transform
 
-    def create_dataloaders(self, batch_size=64, num_workers=4):
+    def create_dataloaders(self, batch_size=192, num_workers=4):
         """Create PyTorch DataLoaders for training"""
         
         # Check if HDF5 data exists
@@ -169,7 +169,7 @@ class HDF5StreamingTrainer:
         # Create DataLoaders
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True, 
-            num_workers=num_workers, pin_memory=True
+            num_workers=num_workers, pin_memory=True, persistent_workers=True
         )
         
         val_loader = DataLoader(
@@ -187,22 +187,29 @@ class HDF5StreamingTrainer:
     def create_model(self, input_shape=(3, 128, 128), use_pretrained=True):
         """Create and setup model with optimizations for better accuracy"""
         print("🏗️  Creating PyTorch model optimized for better accuracy...")
-        
+    
         from model import MultiTaskCNN
-        
-        # Create model
-        self.model = MultiTaskCNN(input_shape=input_shape).to(self.device)
+
+        # Create model (don't move to device yet)
+        self.model = MultiTaskCNN(input_shape=input_shape)
+
+        # Build the model architecture
         self.model.create_model(use_pretrained=use_pretrained)
-        
-        # Setup optimizer and loss (lower learning rate for better convergence)
+
+        # NOW move entire model to device (after all layers are created)
+        self.model = self.model.to(self.device)
+
+        # Setup optimizer and loss
         self.model.compile_model(learning_rate=0.00005, age_weight=1.5, gender_weight=1.0)
-        
+
+        # Verify model is on correct device
+        print(f"✅ Model device: {next(self.model.parameters()).device}")
+
         # Setup learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.model.optimizer, mode='min', factor=0.3, patience=12, 
-            min_lr=1e-8, verbose=True
+            self.model.optimizer, mode='min', factor=0.3, patience=12, min_lr=1e-8
         )
-        
+
         print("✅ PyTorch model created and configured successfully!")
         return self.model
 
